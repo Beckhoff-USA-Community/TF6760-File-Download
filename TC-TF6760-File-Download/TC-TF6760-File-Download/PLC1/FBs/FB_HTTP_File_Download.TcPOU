@@ -1,0 +1,301 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <POU Name="FB_HTTP_File_Download" Id="{c7a28bbb-e77e-4063-a570-9bcebc75cb24}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_HTTP_File_Download
+VAR_INPUT
+	bDownload : BOOL;
+	sSaveFilePath : STRING;
+	sRemoteFilePath : STRING;
+END_VAR
+VAR_IN_OUT
+	fbClient : FB_IotHttpClient;
+END_VAR
+VAR
+	// Execution Trigger
+	rtExecute : R_TRIG;
+	// Reset Trigger
+	ftExecute : F_Trig;
+	// State machine state
+	nState : INT;
+	// HTTP Objects
+	fbRequest			: FB_IotHttpRequest;
+	fbHeader			: FB_IotHttpHeaderFieldMap;
+
+	// Status Struct
+	stStatus : ST_HTTP_File_Download_Status;
+	
+	// Feedback Variables
+	bGetContentResult	: BOOL;
+	sHttpHeaderResponse	: STRING;
+	arrPayload : ARRAY[1..CHUNK_SIZE] OF BYTE;
+	nBatchNumber : UINT := 1;
+	nLowerBound : ULINT;
+	nUpperBount : ULINT;
+	sRange : STRING;
+	bFinalPayload: BOOL;
+	
+	fbFileOpen  : FB_FileOpen;
+	fbFileWrite : FB_FileWrite;
+	fbFileClose : FB_FileClose;
+	fbFileDelete: FB_FileDelete;
+	hFile: UINT;
+END_VAR
+VAR CONSTANT
+	CHUNK_SIZE : ULINT := 1000*1024; // 1000*1024 = 1000Kb Chunk size
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// Rising Edge Execution Trigger
+rtExecute(CLK:= bDownload);
+
+// Reset Status bits when falling edge detected
+ftExecute(CLK:= bDownload);
+
+// Cleanup if falling edge is triggered
+IF ftExecute.Q THEN
+	nState:= 0;
+	stStatus.Busy:= FALSE;
+	stStatus.Done:= FALSE;
+	stStatus.Error:= FALSE;
+	stStatus.ErrorType := E_HTTP_File_Download_Error.None;
+	stStatus.BytesOfData := 0;
+	stStatus.FileSupported := FALSE;
+	stStatus.Progress := 0;
+END_IF
+
+// Main State Machine
+CASE nState OF
+0:	// Send the initial request for the HEAD data
+	IF rtExecute.Q THEN 
+		IF fbRequest.SendRequest(sUri:=sRemoteFilePath, fbClient:=fbClient, eRequestType:=ETcIotHttpRequestType.HTTP_HEAD, 0, 0, 0) THEN	
+			nState:= 10;
+			stStatus.Busy:= TRUE;
+			stStatus.Done:= FALSE;
+			stStatus.Error:= FALSE;
+			stStatus.ErrorType := E_HTTP_File_Download_Error.None;
+			stStatus.BytesOfData := 0;
+			stStatus.FileSupported := FALSE;
+			stStatus.Progress := 0;
+		END_IF					
+	END_IF
+	
+10: // Read if the file is accesible via byte ranges (Accept-Ranges), if not then escape
+	IF NOT fbRequest.bBusy THEN
+		IF NOT fbRequest.bError THEN
+			bGetContentResult:= fbRequest.GetHeaderField(sField:='Accept-Ranges', pValue:= ADR(sHttpHeaderResponse), nValueSize:=SIZEOF(sHttpHeaderResponse)); 
+			IF fbRequest.nStatusCode >= 200 AND fbRequest.nStatusCode < 300 THEN	
+				IF sHttpHeaderResponse = 'bytes' THEN
+					stStatus.FileSupported := TRUE;
+					nState := nState + 10;
+				ELSE
+					stStatus.Error:= TRUE;
+					stStatus.ErrorType := E_HTTP_File_Download_Error.File_Not_Supported;
+					nState := 999;
+				END_IF
+			END_IF
+		ELSE
+			stStatus.Error:= TRUE;
+			stStatus.ErrorType := E_HTTP_File_Download_Error.HTTP_Header_Request_Error;
+			nState := 999;
+		END_IF		
+	END_IF 
+	
+20: // Check the file size
+	IF NOT fbRequest.bBusy THEN
+		IF NOT fbRequest.bError THEN
+			bGetContentResult:= fbRequest.GetHeaderField(sField:='Content-Length', pValue:= ADR(sHttpHeaderResponse), nValueSize:=SIZEOF(sHttpHeaderResponse)); 
+			IF fbRequest.nStatusCode >= 200 AND fbRequest.nStatusCode < 300 THEN		
+				stStatus.BytesOfData := TO_ULINT(sHttpHeaderResponse);	
+				nBatchNumber := 0;
+				bFinalPayload := FALSE;
+				nState := nState + 10;
+			END_IF
+		ELSE
+			stStatus.Error:= TRUE;
+			stStatus.ErrorType := E_HTTP_File_Download_Error.HTTP_Header_Request_Error;
+			nState := 999;
+		END_IF		
+	END_IF 
+	
+30: // Check if file was previously open but not closed properly, if so close
+	IF hFile <> 0 THEN
+		fbFileClose(
+			hFile:= hFile, 
+			bExecute:= TRUE);	
+		IF fbFileClose.bError THEN
+			stStatus.Error := TRUE;
+			stStatus.ErrorType := E_HTTP_File_Download_Error.File_Close_Error;
+			nState := 999;
+		END_IF
+		IF NOT fbFileClose.bBusy THEN
+			fbFileClose(bExecute:= FALSE);
+			hFile := 0;
+			nState := nState + 10;
+		END_IF
+	ELSE
+		nState := nState + 10;
+	END_IF
+	
+40: // File Open
+	fbFileOpen(
+		sNetId:= , 
+		sPathName:= sSaveFilePath, 
+		nMode:= FOPEN_MODEWRITE OR FOPEN_MODEBINARY, 
+		ePath:= PATH_GENERIC, 
+		bExecute:= TRUE, 
+		hFile=> hFile);
+		
+	IF fbFileOpen.bError THEN
+		stStatus.Error := TRUE;
+		stStatus.ErrorType := E_HTTP_File_Download_Error.File_Open_Error;
+		nState := 999;
+	END_IF
+	IF NOT fbFileOpen.bBusy AND hFile <> 0 THEN
+		fbFileOpen(bExecute:= FALSE);
+		nState := nState + 10;
+	END_IF
+	
+50:	// Calculate the byte range
+	nBatchNumber := nBatchNumber + 1;
+	IF nBatchNumber = 1 THEN
+		nLowerBound := (nBatchNumber * CHUNK_SIZE) - CHUNK_SIZE;
+		nUpperBount := (nBatchNumber * CHUNK_SIZE) - 1;
+	ELSE
+		nLowerBound := (nBatchNumber * CHUNK_SIZE) - CHUNK_SIZE;
+		nUpperBount := (nBatchNumber * CHUNK_SIZE) - 1;
+	END_IF
+	
+	sRange := '';
+	sRange := CONCAT('bytes=', TO_STRING(nLowerBound));
+	sRange := CONCAT(sRange, '-');	
+	
+	IF nUpperBount > stStatus.BytesOfData THEN
+		nUpperBount := stStatus.BytesOfData;
+		sRange := CONCAT(sRange, TO_STRING(stStatus.BytesOfData));
+		bFinalPayload := TRUE;
+	ELSE
+		sRange := CONCAT(sRange, TO_STRING(nUpperBount));
+		bFinalPayload := FALSE;
+	END_IF
+	MEMSET(ADR(arrPayload), 0, SIZEOF(arrPayload));
+	nState := nState + 10;
+	
+60:	// Request the byte range
+	fbHeader.AddField('Range', sRange, FALSE);
+	IF fbRequest.SendRequest(sUri:=sRemoteFilePath, fbClient:=fbClient, eRequestType:=ETcIotHttpRequestType.HTTP_GET, 0, 0, fbHeader) THEN	
+		nState := nState + 10;
+	END_IF	
+				
+70: // Read the response
+	IF NOT fbRequest.bBusy THEN
+		IF NOT fbRequest.bError THEN
+			bGetContentResult:= fbRequest.GetContent(pContent:= ADR(arrPayload), nContentSize:= SIZEOF(arrPayload), bSetNullTermination:= FALSE);
+			IF fbRequest.nStatusCode >= 200 AND fbRequest.nStatusCode < 300 THEN		
+				nState := nState + 10;
+			END_IF
+		ELSE
+			stStatus.Error:= TRUE;
+			stStatus.ErrorType := E_HTTP_File_Download_Error.HTTP_Content_Request_Error;
+			nState := 999;
+		END_IF		
+	END_IF 
+	
+80: // File Write
+	stStatus.Progress := (TO_LREAL(nUpperBount) / TO_LREAL(stStatus.BytesOfData)) * 100.0;
+	
+	IF NOT bFinalPayload THEN
+		fbFileWrite(
+			hFile:= hFile, 
+			pWriteBuff:= ADR(arrPayload), 
+			cbWriteLen:= SIZEOF(arrPayload), 
+			bExecute:= TRUE);
+	ELSE
+		fbFileWrite(
+			hFile:= hFile, 
+			pWriteBuff:= ADR(arrPayload), 
+			cbWriteLen:= TO_UDINT(nUpperBount - nLowerBound), 
+			bExecute:= TRUE);
+	END_IF
+	IF fbFileWrite.bError THEN
+		stStatus.Error := TRUE;
+		stStatus.ErrorType := E_HTTP_File_Download_Error.File_Write_Error;
+		nState := 999;
+	END_IF
+	IF NOT fbFileWrite.bBusy THEN
+		fbFileWrite(bExecute:= FALSE);
+		IF NOT bFinalPayload THEN
+			nState :=  50;
+		ELSE
+			nState := nState + 10;
+		END_IF
+	END_IF
+
+90: // File Close
+	fbFileClose(
+		hFile:= hFile, 
+		bExecute:= TRUE);
+		
+	IF fbFileClose.bError THEN
+		stStatus.Error := TRUE;
+		stStatus.ErrorType := E_HTTP_File_Download_Error.File_Close_Error;
+		nState := 999;
+	END_IF
+	IF NOT fbFileClose.bBusy THEN
+		fbFileClose(bExecute:= FALSE);
+		hFile := 0;
+		nState := 1000;
+	END_IF
+
+1000:
+	// Complete
+	stStatus.Busy:= FALSE;
+	stStatus.Done:= TRUE;
+	stStatus.Progress := 100;
+	nState := 0;
+END_CASE
+
+
+]]></ST>
+    </Implementation>
+    <Property Name="P_Status" Id="{a787ddb6-2397-4b45-9ed5-ea53a75b373f}">
+      <Declaration><![CDATA[PROPERTY P_Status : REFERENCE TO ST_HTTP_File_Download_Status]]></Declaration>
+      <Get Name="Get" Id="{714d18e1-1d54-4dcc-9138-d13cea9713e2}">
+        <Declaration><![CDATA[VAR
+END_VAR
+]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[P_Status REF= stStatus;]]></ST>
+        </Implementation>
+      </Get>
+    </Property>
+    <LineIds Name="FB_HTTP_File_Download">
+      <LineId Id="1091" Count="0" />
+      <LineId Id="906" Count="3" />
+      <LineId Id="1130" Count="2" />
+      <LineId Id="1140" Count="7" />
+      <LineId Id="919" Count="54" />
+      <LineId Id="1186" Count="1" />
+      <LineId Id="1253" Count="0" />
+      <LineId Id="1189" Count="2" />
+      <LineId Id="1193" Count="8" />
+      <LineId Id="1255" Count="1" />
+      <LineId Id="1252" Count="0" />
+      <LineId Id="1254" Count="0" />
+      <LineId Id="974" Count="28" />
+      <LineId Id="1092" Count="0" />
+      <LineId Id="1004" Count="36" />
+      <LineId Id="1209" Count="0" />
+      <LineId Id="1041" Count="12" />
+      <LineId Id="1056" Count="25" />
+      <LineId Id="1152" Count="0" />
+      <LineId Id="1082" Count="8" />
+      <LineId Id="9" Count="0" />
+      <LineId Id="1111" Count="0" />
+      <LineId Id="1129" Count="0" />
+      <LineId Id="1110" Count="0" />
+    </LineIds>
+    <LineIds Name="FB_HTTP_File_Download.P_Status.Get">
+      <LineId Id="2" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

@@ -1,0 +1,20 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <DUT Name="E_HTTP_File_Download_Error" Id="{3750ee3e-6414-46fa-83f3-96ee0ea98c26}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+{attribute 'strict'}
+TYPE E_HTTP_File_Download_Error :
+(
+	None := 0,
+	HTTP_Header_Request_Error := 1,
+	HTTP_Content_Request_Error := 2,
+	File_Open_Error := 3,
+	File_Write_Error := 4,
+	File_Close_Error := 5,
+	File_Delete_Error := 6,
+	File_Not_Supported := 7
+);
+END_TYPE
+]]></Declaration>
+  </DUT>
+</TcPlcObject>
